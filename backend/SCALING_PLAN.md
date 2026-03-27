@@ -1,5 +1,134 @@
 # Backend Scaling Plan — Traffic Surge Readiness
 
+---
+
+## 0. Should We Split Into Microservices?
+
+> *Context: users only authenticate to perform check-in or check-out.*
+
+### Short answer: No — not along the auth/attendance boundary.
+
+Splitting auth and attendance into separate services sounds intuitive, but the specific usage pattern here makes it one of the worst boundaries to cut along. Here is why.
+
+---
+
+### The user journey is a single atomic operation
+
+When the primary reason to log in is to check in or check out, auth and attendance are not two independent operations — they are one:
+
+```
+Login  ──────────────────────────────────►  Check In
+  └─ validates identity                       └─ records presence
+
+These are steps in one intent, not two separate concerns.
+```
+
+If the attendance service is unavailable, the login is worthless. If the auth service is unavailable, the attendance service is unreachable. They have a **100% availability coupling** — a property that makes microservice separation purely costly, with no independence benefit.
+
+Compare this to a system where auth is shared across many products (HR portal, payroll, leave management, expense system). In that case, auth absolutely deserves to be its own service. Here, it serves one product's one feature.
+
+---
+
+### JWT is already stateless — auth is not a service call
+
+The real-world reason people split auth into a microservice is to centralise token validation: every downstream service calls the auth service to ask "is this token valid?"
+
+JWT eliminates that need. The attendance service validates the token **locally, in-process**, by verifying the signature with a shared secret. No network call, no auth service, no latency. The auth module in the current NestJS monolith already works this way — `JwtStrategy` runs inside the same process as `AttendanceController`.
+
+If you split them into separate processes, you have two choices, both worse:
+
+| Option | Problem |
+|--------|---------|
+| Each service validates JWT locally (shared secret) | You've gained nothing — same behaviour as the monolith, plus deployment overhead |
+| Attendance calls auth service to validate token | Added network hop on every single request — directly worsens the performance of the hot path |
+
+---
+
+### The real cost of microservices for this pattern
+
+Splitting introduces costs that compound at scale:
+
+| Cost | Impact |
+|------|--------|
+| Network latency per request | 1–5ms added to every check-in, which must be fast |
+| Distributed tracing | Debugging a failed check-in now spans two service logs |
+| Deployment coordination | Auth and Attendance must be versioned and deployed together |
+| Service discovery & health checks | Operational overhead with no throughput benefit |
+| Token passing between services | Either duplicate validation or a service-to-service auth layer |
+
+None of these costs buy you anything, because the **bottleneck is the database write path** — not compute on the API tier. You can scale the API tier cheaply by running more instances of the monolith behind a load balancer. Splitting into services does not change the DB write throughput.
+
+---
+
+### The split that does make sense: Employee API vs Admin API
+
+If you need a service boundary for genuine reasons — different security perimeter, different scaling profile, separate team ownership — the correct cut is **not auth vs attendance**. It is **employee-facing vs admin-facing**:
+
+```
+┌─────────────────────────────────┐     ┌─────────────────────────────────┐
+│   Employee API                  │     │   Admin API                     │
+│                                 │     │                                 │
+│  POST /auth/login               │     │  POST /auth/login               │
+│  POST /attendance/check-in      │     │  GET  /admin/attendance         │
+│  POST /attendance/check-out     │     │  GET  /admin/employees          │
+│  GET  /attendance/summary       │     │  PATCH /admin/employees/:id     │
+│  GET  /me                       │     │                                 │
+│                                 │     │                                 │
+│  Traffic: 2× daily spikes       │     │  Traffic: steady, low volume    │
+│  Writes: heavy                  │     │  Reads: heavy (large datasets)  │
+│  Latency requirement: strict    │     │  Latency requirement: relaxed   │
+└─────────────────────────────────┘     └─────────────────────────────────┘
+         │                                         │
+         └─────────────────┬───────────────────────┘
+                           ▼
+                   Shared Postgres + Redis
+```
+
+These two have genuinely different profiles:
+- **Employee API** is write-heavy, latency-sensitive, and bursty. It must be fast and horizontally scalable.
+- **Admin API** is read-heavy, serves large datasets (all employees, monthly reports), and is accessed by a small number of users on an unpredictable schedule.
+
+Separating them means:
+- You can scale Employee API instances during the morning surge without scaling Admin API
+- A heavy admin report query (full table scan over 1M records) cannot steal connections or CPU from employee check-ins
+- You can put a stricter rate limiter and network policy on Admin API (internal VPN only, for example)
+
+---
+
+### The split that solves the actual bottleneck: API tier vs Worker tier
+
+The scaling plan already identifies this in Phase 3. The most impactful architectural boundary is not between services — it is between **synchronous request handling** and **asynchronous write processing**:
+
+```
+┌────────────────────────┐        ┌────────────────────────┐
+│  API Tier              │        │  Worker Tier            │
+│  (NestJS — stateless)  │        │  (NestJS — consumers)   │
+│                        │        │                         │
+│  - Validates JWT       │        │  - Batch flush to PG    │
+│  - Writes to Redis     │──────► │  - Send notifications   │
+│  - Returns 201 fast    │  queue │  - Sync to payroll      │
+│                        │        │  - Generate reports     │
+│  Scale: many instances │        │  Scale: per queue depth │
+└────────────────────────┘        └────────────────────────┘
+```
+
+This is horizontal separation of *concerns*, not services for their own sake. Both tiers can be the same NestJS codebase deployed in two modes (`APP_MODE=api` vs `APP_MODE=worker`), sharing all the same modules, types, and repository code.
+
+---
+
+### Decision summary
+
+| Split | Worth it? | Reason |
+|-------|-----------|--------|
+| Auth service + Attendance service | **No** | JWT is stateless; they are one user intent; adds latency with zero throughput gain |
+| Employee API + Admin API | **Yes, at scale** | Genuinely different traffic profiles, security boundaries, and scaling needs |
+| API tier + Worker tier | **Yes, essential at 1M** | Directly addresses the write bottleneck identified in Section 8 |
+| One module per domain within a monolith | **Yes, now** | Low cost, keeps the codebase organised, easy to extract later if needed |
+
+The current NestJS module structure (auth, attendance, admin, me) is already the right shape. Keep it as a modular monolith. If team size or traffic forces a split, cut along the Employee/Admin boundary — not auth/attendance.
+
+---
+
 ## 1. The Problem: Predictable but Brutal Spikes
 
 Attendance systems have one of the most lopsided traffic profiles in enterprise software. Traffic is near-zero for most of the day, then slams into two sharp peaks:
